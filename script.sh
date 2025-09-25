@@ -19,16 +19,23 @@ SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 # Tu usuario humano (para evitar el 403 al ver/editar IAM del bucket)
 USER_EMAIL="naat.lab.ia@gmail.com"
 
-# Buckets (usa nombres reales, únicos globalmente)
-DATA_BUCKET="tu-bucket-datos"       # lectura de datos
-STAGING_BUCKET="tu-bucket-staging"  # escritura de artefactos/resultados
+# ⚠️ PON NOMBRES ÚNICOS GLOBALES
+DATA_BUCKET="tu-bucket-datos"       # p.ej. naat-lab-ai-datos-us
+STAGING_BUCKET="tu-bucket-staging"  # p.ej. naat-lab-ai-staging-us
 
-# (Opcional) Otorgar a tu usuario Storage Admin a nivel PROYECTO (ayuda a evitar 403)
+# (Opcional) dar a tu usuario Storage Admin a nivel proyecto (evita 403 al tocar IAM de buckets)
 GRANT_USER_PROJECT_STORAGE_ADMIN="true"
 
 ### =========================
 echo "[1/10] Set project"
 gcloud config set project "${PROJECT_ID}" >/dev/null
+
+### Validación de buckets
+if [[ "${DATA_BUCKET}" == "tu-bucket-datos" || "${STAGING_BUCKET}" == "tu-bucket-staging" ]]; then
+  echo "ERROR: Debes poner nombres únicos en DATA_BUCKET/STAGING_BUCKET antes de ejecutar."
+  echo "Sugerencias: ${PROJECT_ID}-datos-${REGION}  y  ${PROJECT_ID}-staging-${REGION}"
+  exit 1
+fi
 
 ### =========================
 echo "[2/10] Enable required APIs (idempotente)"
@@ -83,10 +90,8 @@ else
 fi
 
 ### =========================
-echo "[7/10] Create BigQuery dataset (idempotente)"
+echo "[7/10] Create BigQuery dataset (idempotente) y bindings de SA"
 bq --location="${BQ_LOCATION}" mk -d "${PROJECT_ID}:${BQ_DATASET}" 2>/dev/null || true
-
-echo "[7b/10] Bind SA to BigQuery dataset (dataEditor + jobUser)"
 bq add-iam-policy-binding "${PROJECT_ID}:${BQ_DATASET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/bigquery.dataEditor" 2>/dev/null || true
@@ -95,25 +100,41 @@ bq add-iam-policy-binding "${PROJECT_ID}:${BQ_DATASET}" \
   --role="roles/bigquery.jobUser" 2>/dev/null || true
 
 ### =========================
-create_bucket() {
+# Funciones auxiliares para buckets
+bucket_owner_project_number() {
+  # Devuelve el projectNumber propietario del bucket (o vacío si no existe o no accesible)
+  gcloud storage buckets describe "gs://${1}" --format="value(projectNumber)" 2>/dev/null || true
+}
+
+create_bucket_with_pap_if_possible() {
   local BUCKET="$1"
-  # Si no existe, créalo con UBLE y PAP enforced
-  if ! gcloud storage buckets describe "gs://${BUCKET}" >/dev/null 2>&1; then
-    echo "  - Creando bucket gs://${BUCKET} ..."
-    # Intento 1: crear con --pap enforced (gcloud reciente)
-    if ! gcloud storage buckets create "gs://${BUCKET}" \
+
+  # Si ya existe, no lo creamos
+  if gcloud storage buckets describe "gs://${BUCKET}" >/dev/null 2>&1; then
+    echo "  - Bucket gs://${BUCKET} ya existe"
+    return 0
+  fi
+
+  echo "  - Creando bucket gs://${BUCKET} ..."
+  # Intento 1: crear con --pap enforced (gcloud reciente)
+  if gcloud storage buckets create "gs://${BUCKET}" \
       --location="${BQ_LOCATION}" \
       --uniform-bucket-level-access \
       --pap enforced >/dev/null 2>&1; then
-        # Fallback para gcloud antiguos: crea sin --pap y luego aplica update --pap
-        echo "    * 'create --pap enforced' no soportado; usando 'create' + 'update --pap enforced'"
-        gcloud storage buckets create "gs://${BUCKET}" \
-          --location="${BQ_LOCATION}" \
-          --uniform-bucket-level-access >/dev/null || true
-        gcloud storage buckets update "gs://${BUCKET}" --pap enforced >/dev/null || true
-    fi
+    return 0
+  fi
+
+  # Si falla por flag no soportado, crea sin PAP y trata de actualizar PAP
+  echo "    * 'create --pap enforced' no soportado; usando 'create' + 'update --pap enforced' (si está disponible)"
+  gcloud storage buckets create "gs://${BUCKET}" \
+      --location="${BQ_LOCATION}" \
+      --uniform-bucket-level-access >/dev/null || true
+
+  # Intento de update PAP (si tu gcloud lo soporta)
+  if gcloud storage buckets update --help 2>/dev/null | grep -q -- '--pap'; then
+    gcloud storage buckets update "gs://${BUCKET}" --pap enforced >/dev/null || true
   else
-    echo "  - Bucket gs://${BUCKET} ya existe"
+    echo "    * Tu versión de gcloud no soporta 'buckets update --pap'; continuo sin PAP enforced."
   fi
 }
 
@@ -132,19 +153,24 @@ bind_bucket_iam() {
 }
 
 echo "[8/10] Create buckets (idempotentes) y IAM específico"
-if [ -n "${DATA_BUCKET}" ]; then
-  create_bucket "${DATA_BUCKET}"
-  # Usuario: admin del bucket (permite ver/editar policy sin 403)
-  # SA: lectura de objetos
-  bind_bucket_iam "${DATA_BUCKET}" "roles/storage.admin" "roles/storage.objectViewer"
-fi
 
-if [ -n "${STAGING_BUCKET}" ]; then
-  create_bucket "${STAGING_BUCKET}"
-  # Usuario: admin del bucket
-  # SA: escritura de objetos (artefactos/resultados)
-  bind_bucket_iam "${STAGING_BUCKET}" "roles/storage.admin" "roles/storage.objectAdmin"
+# DATA BUCKET
+OWNER_PN="$(bucket_owner_project_number "${DATA_BUCKET}")" || true
+if [[ -n "${OWNER_PN}" && "${OWNER_PN}" != "${PROJECT_NUMBER}" ]]; then
+  echo "ERROR: El bucket gs://${DATA_BUCKET} pertenece a otro proyecto (${OWNER_PN}). Elige otro nombre único."
+  exit 1
 fi
+create_bucket_with_pap_if_possible "${DATA_BUCKET}"
+bind_bucket_iam "${DATA_BUCKET}" "roles/storage.admin" "roles/storage.objectViewer"
+
+# STAGING BUCKET
+OWNER_PN="$(bucket_owner_project_number "${STAGING_BUCKET}")" || true
+if [[ -n "${OWNER_PN}" && "${OWNER_PN}" != "${PROJECT_NUMBER}" ]]; then
+  echo "ERROR: El bucket gs://${STAGING_BUCKET} pertenece a otro proyecto (${OWNER_PN}). Elige otro nombre único."
+  exit 1
+fi
+create_bucket_with_pap_if_possible "${STAGING_BUCKET}"
+bind_bucket_iam "${STAGING_BUCKET}" "roles/storage.admin" "roles/storage.objectAdmin"
 
 ### =========================
 echo "[9/10] Create BigQuery tables con schema (idempotente)"
@@ -179,23 +205,32 @@ cat > "${TMP_DIR}/best_schema.json" <<'EOF'
 ]
 EOF
 
-bq --location="${BQ_LOCATION}" mk -t \
-  --schema="${TMP_DIR}/trials_schema.json" \
-  "${PROJECT_ID}:${BQ_DATASET}.${BQ_TRIALS_TABLE}" 2>/dev/null || true
+# Crea tablas sólo si no existen
+if ! bq show -t "${PROJECT_ID}:${BQ_DATASET}.${BQ_TRIALS_TABLE}" >/dev/null 2>&1; then
+  bq --location="${BQ_LOCATION}" mk -t \
+    --schema="${TMP_DIR}/trials_schema.json" \
+    "${PROJECT_ID}:${BQ_DATASET}.${BQ_TRIALS_TABLE}"
+else
+  echo "  - Tabla ${BQ_TRIALS_TABLE} ya existe (ok)"
+fi
 
-bq --location="${BQ_LOCATION}" mk -t \
-  --schema="${TMP_DIR}/best_schema.json" \
-  "${PROJECT_ID}:${BQ_DATASET}.${BQ_BEST_TABLE}" 2>/dev/null || true
+if ! bq show -t "${PROJECT_ID}:${BQ_DATASET}.${BQ_BEST_TABLE}" >/dev/null 2>&1; then
+  bq --location="${BQ_LOCATION}" mk -t \
+    --schema="${TMP_DIR}/best_schema.json" \
+    "${PROJECT_ID}:${BQ_DATASET}.${BQ_BEST_TABLE}"
+else
+  echo "  - Tabla ${BQ_BEST_TABLE} ya existe (ok)"
+fi
 
 ### =========================
 echo "[10/10] Resumen"
 echo "==============================================="
-echo "Proyecto:     ${PROJECT_ID}"
+echo "Proyecto:     ${PROJECT_ID} (PN=${PROJECT_NUMBER})"
 echo "SA:           ${SA_EMAIL}"
 echo "Dataset BQ:   ${BQ_DATASET} (loc=${BQ_LOCATION})"
 echo "Tablas BQ:    ${BQ_TRIALS_TABLE}, ${BQ_BEST_TABLE}"
-[ -n "${DATA_BUCKET}" ]   && echo "Data bucket:  gs://${DATA_BUCKET}"
-[ -n "${STAGING_BUCKET}" ]&& echo "Staging:      gs://${STAGING_BUCKET}"
+echo "Data bucket:  gs://${DATA_BUCKET}"
+echo "Staging:      gs://${STAGING_BUCKET}"
 echo "==============================================="
 
 # Verificación opcional (debería mostrar policy sin 403):
