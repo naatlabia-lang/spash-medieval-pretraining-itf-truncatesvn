@@ -12,20 +12,23 @@ BQ_DATASET="nlp_metrics"
 BQ_TRIALS_TABLE="tfidf_svd_trials"
 BQ_BEST_TABLE="tfidf_svd_best"
 
-# Service Account
+# Service Account para los jobs de Vertex
 SA_NAME="vertex-train-sa"
 SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
-# (Opcional) buckets
-DATA_BUCKET="tu-bucket-datos"          # donde está tu CSV, solo lectura
-STAGING_BUCKET="tu-bucket-staging"     # donde el job escribirá resultados
+# Tu usuario humano (para evitar el 403 al leer/editar IAM del bucket)
+USER_EMAIL="naat.lab.ia@gmail.com"
+
+# Buckets (usa nombres reales, únicos a nivel global)
+DATA_BUCKET="tu-bucket-datos"       # lectura de datos
+STAGING_BUCKET="tu-bucket-staging"  # escritura de artefactos/resultados
 
 ### =========================
-echo "[1/7] Set project"
+echo "[1/9] Set project"
 gcloud config set project "${PROJECT_ID}" >/dev/null
 
 ### =========================
-echo "[2/7] Enable required APIs (idempotente)"
+echo "[2/9] Enable required APIs (idempotente)"
 gcloud services enable \
   aiplatform.googleapis.com \
   bigquery.googleapis.com \
@@ -36,7 +39,7 @@ gcloud services enable \
   iamcredentials.googleapis.com
 
 ### =========================
-echo "[3/7] Create Service Account (si no existe)"
+echo "[3/9] Create Service Account (si no existe)"
 if ! gcloud iam service-accounts list --format="value(email)" | grep -q "^${SA_EMAIL}$"; then
   gcloud iam service-accounts create "${SA_NAME}" \
     --display-name="Vertex Training SA"
@@ -45,25 +48,29 @@ else
 fi
 
 ### =========================
-echo "[4/7] Grant roles to SA (proyecto) - idempotente"
+echo "[4/9] Grant minimal project roles to SA (idempotente)"
+# Nota: evitamos storage.admin/object* a nivel PROYECTO; daremos acceso por BUCKET más abajo.
 for ROLE in \
   roles/bigquery.jobUser \
   roles/bigquery.dataEditor \
-  roles/storage.objectViewer \
-  roles/storage.objectAdmin \
   roles/artifactregistry.reader \
   roles/logging.logWriter \
-  roles/monitoring.metricWriter \
-  roles/storage.admin 
-  
+  roles/monitoring.metricWriter
 do
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${SA_EMAIL}" \
     --role="${ROLE}" >/dev/null || true
 done
 
-### (Opcional) IAM a nivel dataset de BigQuery (además de los roles de proyecto)
-echo "[4b/7] (Opcional) Bindings de dataset BigQuery"
+### =========================
+echo "[5/9] Allow Vertex AI to impersonate the SA"
+PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+gcloud iam service-accounts add-iam-policy-binding "${SA_EMAIL}" \
+  --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-aiplatform.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser" >/dev/null || true
+
+### =========================
+echo "[6/9] (Opcional) IAM a nivel dataset de BigQuery"
 bq add-iam-policy-binding "${PROJECT_ID}:${BQ_DATASET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/bigquery.dataEditor" 2>/dev/null || true
@@ -72,22 +79,39 @@ bq add-iam-policy-binding "${PROJECT_ID}:${BQ_DATASET}" \
   --role="roles/bigquery.jobUser" 2>/dev/null || true
 
 ### =========================
-echo "[5/7] Create buckets (opcionales, idempotentes)"
+echo "[7/9] Create buckets (idempotentes) y IAM específico"
 if [ -n "${DATA_BUCKET}" ]; then
-  gsutil mb -l "${BQ_LOCATION}" -b on "gs://${DATA_BUCKET}" 2>/dev/null || true
-  gsutil iam ch "serviceAccount:${SA_EMAIL}:objectViewer" "gs://${DATA_BUCKET}" >/dev/null || true
+  # Crear bucket si no existe
+  gcloud storage buckets create "gs://${DATA_BUCKET}" --location="${BQ_LOCATION}" \
+    --uniform-bucket-level-access --public-access-prevention=enforced >/dev/null || true
+
+  # Permisos bucket-level:
+  #  - Tu USUARIO humano como admin del bucket (evita 403 al ver/editar IAM)
+  gcloud storage buckets add-iam-policy-binding "gs://${DATA_BUCKET}" \
+    --member="user:${USER_EMAIL}" --role="roles/storage.admin" >/dev/null || true
+  #  - La SA con lectura de objetos
+  gcloud storage buckets add-iam-policy-binding "gs://${DATA_BUCKET}" \
+    --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectViewer" >/dev/null || true
 fi
+
 if [ -n "${STAGING_BUCKET}" ]; then
-  gsutil mb -l "${BQ_LOCATION}" -b on "gs://${STAGING_BUCKET}" 2>/dev/null || true
-  gsutil iam ch "serviceAccount:${SA_EMAIL}:objectAdmin" "gs://${STAGING_BUCKET}" >/dev/null || true
+  gcloud storage buckets create "gs://${STAGING_BUCKET}" --location="${BQ_LOCATION}" \
+    --uniform-bucket-level-access --public-access-prevention=enforced >/dev/null || true
+
+  # Tu USUARIO humano admin del bucket (para evitar 403)
+  gcloud storage buckets add-iam-policy-binding "gs://${STAGING_BUCKET}" \
+    --member="user:${USER_EMAIL}" --role="roles/storage.admin" >/dev/null || true
+  # La SA con permisos de escritura de objetos
+  gcloud storage buckets add-iam-policy-binding "gs://${STAGING_BUCKET}" \
+    --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectAdmin" >/dev/null || true
 fi
 
 ### =========================
-echo "[6/7] Create BigQuery dataset (idempotente)"
+echo "[8/9] Create BigQuery dataset (idempotente)"
 bq --location="${BQ_LOCATION}" mk -d "${PROJECT_ID}:${BQ_DATASET}" 2>/dev/null || true
 
 ### =========================
-echo "[7/7] Create BigQuery tables con schema (idempotente)"
+echo "[9/9] Create BigQuery tables con schema (idempotente)"
 TMP_DIR="$(mktemp -d)"
 cat > "${TMP_DIR}/trials_schema.json" <<'EOF'
 [
@@ -119,7 +143,6 @@ cat > "${TMP_DIR}/best_schema.json" <<'EOF'
 ]
 EOF
 
-# Crear tablas (si no existen)
 bq --location="${BQ_LOCATION}" mk -t \
   --schema="${TMP_DIR}/trials_schema.json" \
   "${PROJECT_ID}:${BQ_DATASET}.${BQ_TRIALS_TABLE}" 2>/dev/null || true
@@ -137,3 +160,7 @@ echo "Tablas BQ:    ${BQ_TRIALS_TABLE}, ${BQ_BEST_TABLE}"
 [ -n "${DATA_BUCKET}" ]   && echo "Data bucket:  gs://${DATA_BUCKET}"
 [ -n "${STAGING_BUCKET}" ]&& echo "Staging:      gs://${STAGING_BUCKET}"
 echo "==============================================="
+
+# Verificación opcional (debería mostrar política sin 403):
+# gcloud storage buckets get-iam-policy "gs://${DATA_BUCKET}" || true
+# gcloud storage buckets get-iam-policy "gs://${STAGING_BUCKET}" || true
