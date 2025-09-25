@@ -53,7 +53,9 @@ for ROLE in \
   roles/storage.objectAdmin \
   roles/artifactregistry.reader \
   roles/logging.logWriter \
-  roles/monitoring.metricWriter
+  roles/monitoring.metricWriter \
+  roles/storage.admin 
+  
 do
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${SA_EMAIL}" \
